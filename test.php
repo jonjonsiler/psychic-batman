@@ -9,6 +9,7 @@ echo $v;
 
 $i ="another item";
 echo $i;
+echo "Gee whiz, pa";
 
 #this is the last item
 $p = "Another item";
