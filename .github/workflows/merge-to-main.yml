@@ -1,4 +1,4 @@
-name: OLP - CI Build
+name: Create Pull Request - develop to main
 on: workflow_dispatch
 
 jobs:
@@ -33,6 +33,7 @@ jobs:
       - name: Run the Action
         uses: devops-infra/action-pull-request@v0.5.5
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           title: Merging develop to main @${{ env.NEXT_VERSION }} for QA release
           assignee: ${{ github.actor }}
           label: release,qa
