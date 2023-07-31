@@ -1,0 +1,45 @@
+name: Create Pull Request - develop to main
+on: workflow_dispatch
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      tag_version: ${{ steps.version.outputs.tag_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install gitversion
+        uses: gittools/actions/gitversion/setup@v0.9.14
+        with:
+          versionSpec: '5.x'
+
+      - name: Increment version
+        id: version
+        run: |
+          CURRENT_VERSION=$(dotnet-gitversion -showvariable semVer)
+          NEXT_VERSION=$(dotnet-gitversion -showvariable semVer)
+          echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
+          echo "NEXT_VERSION=$NEXT_VERSION" >> $GITHUB_ENV
+          echo "tag_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "new_tag_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          echo "::notice title=Version::$CURRENT_VERSION"
+
+      - name: Run the Action
+        uses: devops-infra/action-pull-request@v0.5.5
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          title: Merging develop to main @${{ env.NEXT_VERSION }} for QA release
+          assignee: ${{ github.actor }}
+          label: release,qa
+          template: .github/PULL_REQUEST_TEMPLATE/merge-to-main.md
+          old_string: "**OLD_VERSION**"
+          new_string: ${{ env.CURRENT_VERSION }}
+          source_branch: develop
+          target_branch: main
+          get_diff: true
