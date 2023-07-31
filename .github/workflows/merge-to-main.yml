@@ -1,0 +1,200 @@
+name: OLP - CI Build
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      tag_version: ${{ steps.version.outputs.tag_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          cache: npm
+
+      - name: Install gitversion
+        uses: gittools/actions/gitversion/setup@v0.9.14
+        with:
+          versionSpec: '5.x'
+
+      - name: Increment version
+        id: version
+        run: |
+          TAG_VERSION=$(dotnet-gitversion -showvariable semVer)
+          npm version --no-git-tag-version $TAG_VERSION
+          echo "TAG_VERSION=$TAG_VERSION" >> $GITHUB_ENV
+          echo "tag_version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "::notice title=Version::$TAG_VERSION"
+
+      # configure npm authentication for github packages, needs a read-only
+      # PAT token for accessing internal repos
+      - name: Configure NPM authentication
+        run: npm config set "//npm.pkg.github.com/:_authToken" ${{ secrets.NPM_TOKEN_READ }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      # determine build configuration from branch/env and run build
+      - name: Build
+        run: |
+          build_conf=development
+          if [[ "${{ github.ref_name }}" == main || "${{ github.ref_name }}" == hotfix/* ]]; then
+            build_conf=production
+          fi
+          echo "::notice title=Build Configuration::$build_conf"
+          npx ng build --configuration=$build_conf
+
+          # remove configuration.json and runtime/IS.ini configs
+          rm -f dist/stage/configuration.json dist/stage/runtime/IS.Ini > /dev/null || true
+
+      # save a zip artifact of dist/stage/ dir to github
+      - name: Save artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifact
+          path: dist/stage/
+
+      # if on main, use gitversion to increment version and publish NPM package
+      - name: Publish NPM package
+        if: github.ref_name == 'main' || inputs.create_npm == true
+        run: |
+          npm config set "//npm.pkg.github.com/:_authToken" ${{ github.token }}
+          npm publish
+          echo "::notice title=NPM Package::Built version $TAG_VERSION"
+
+      - name: Tag version
+        if: (github.ref_name == 'main' || inputs.create_npm == true) && env.TAG_VERSION
+        run: |
+          git config user.name 'GitHub Actions Bot'
+          git config user.email 'bot@github.com'
+          git tag v${TAG_VERSION} --annotate --force -m '${{ github.workflow }} - automated version tag'
+          git push origin v${TAG_VERSION} --force
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    environment: Development
+    needs: build
+    if: github.ref_name == 'develop'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # download artifact from build task instead of rebuilding
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifact
+          path: dist/stage/
+
+      # authenticate AWS credentials from secrets for CLI usage
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Setup s5cmd
+        uses: istation-devops/s5cmd-action@v1
+
+      # upload/sync dist files to S3 bucket
+      - name: Deploy files to S3
+        run: |
+          cd dist/stage
+          find . -type f -exec touch '{}' + || true
+          s5cmd sync --delete --exclude configuration.json --exclude runtime/IS.Ini . s3://${{ secrets.S3_BUCKET }}
+          # add cache-control headers to specific files
+          s5cmd cp --cache-control 'no-cache' index.html s3://${{ secrets.S3_BUCKET }}
+
+      # clear CloudFront cache for all files
+      - name: Invalidate CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id ${{ secrets.CF_DIST_ID }} --paths "/*"
+
+      # tag dev version after successful deployment
+      - name: Tag version
+        env:
+          TAG_VERSION: ${{ needs.build.outputs.tag_version }}
+        run: |
+          git config user.name 'GitHub Actions Bot'
+          git config user.email 'bot@github.com'
+          git tag v${TAG_VERSION} --force -m '${{ github.workflow }} - automated version tag'
+          git push origin v${TAG_VERSION} --force
+
+  deploy-qa:
+    name: Deploy to QA
+    runs-on: ubuntu-latest
+    environment: QA
+    needs: build
+    # if manually triggered from hotfix branch with 'create npm' option, also deploy to QA
+    if: github.ref_name == 'main' || (startsWith(github.ref_name, 'hotfix/') && inputs.create_npm == true)
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifact
+          path: dist/stage/
+
+      # authenticate AWS credentials from secrets for CLI usage
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Setup s5cmd
+        uses: istation-devops/s5cmd-action@v1
+
+      # upload/sync dist files to S3 bucket
+      - name: Deploy files to S3
+        run: |
+          cd dist/stage
+          find . -type f -exec touch '{}' + || true
+          s5cmd sync --delete --exclude configuration.json --exclude runtime/IS.Ini . s3://${{ secrets.S3_BUCKET }}
+          # add cache-control headers to specific files
+          s5cmd cp --cache-control 'no-cache' index.html s3://${{ secrets.S3_BUCKET }}
+
+      # clear CloudFront cache for all files
+      - name: Invalidate CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id ${{ secrets.CF_DIST_ID }} --paths "/*"
+
+      - name: Notify release specific Slack channel
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          payload: |
+            {"blocks": [{
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": "*Student Experience v${{ needs.build.outputs.tag_version }} deployed to QA*"},
+              "accessory": {"type": "button", "text": {"type": "plain_text", "text": "View Release"}, "url": "${{ github.event.head_commit.url || github.event.repository.html_url }}"}
+            }]}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_QA }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify general Slack channel
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          payload: |
+            {"blocks": [{
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": "*Student Experience v${{ needs.build.outputs.tag_version }} deployed to QA*"},
+              "accessory": {"type": "button", "text": {"type": "plain_text", "text": "View Release"}, "url": "${{ github.event.head_commit.url || github.event.repository.html_url }}"}
+            }]}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
