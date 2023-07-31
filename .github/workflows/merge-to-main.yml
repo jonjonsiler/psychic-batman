@@ -40,4 +40,6 @@ jobs:
           template: .github/PULL_REQUEST_TEMPLATE/merge-to-main.md
           old_string: "**OLD_VERSION**"
           new_string: ${{ env.CURRENT_VERSION }}
+          source_branch: develop
+          target_branch: main
           get_diff: true
